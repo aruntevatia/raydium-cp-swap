@@ -2,19 +2,14 @@ use crate::error::ErrorCode;
 use anchor_lang::{prelude::*, system_program};
 use anchor_spl::{
     token::{Token, TokenAccount},
-    token_2022::{
-        self,
-        spl_token_2022::{
-            self,
-            extension::{
-                transfer_fee::{TransferFeeConfig, MAX_FEE_BASIS_POINTS},
-                ExtensionType, StateWithExtensions,
-            },
-        },
-    },
-    token_interface::{
-        initialize_account3, spl_token_2022::extension::BaseStateWithExtensions,
-        InitializeAccount3, Mint,
+    token_2022::{self},
+    token_interface::{initialize_account3, InitializeAccount3, Mint},
+};
+use spl_token_2022::{
+    self,
+    extension::{
+        transfer_fee::{TransferFeeConfig, MAX_FEE_BASIS_POINTS},
+        BaseStateWithExtensions, ExtensionType, StateWithExtensions,
     },
 };
 use std::collections::HashSet;
@@ -145,9 +140,16 @@ pub fn get_transfer_inverse_fee(mint_info: &AccountInfo, post_fee_amount: u64) -
         if u16::from(transfer_fee.transfer_fee_basis_points) == MAX_FEE_BASIS_POINTS {
             u64::from(transfer_fee.maximum_fee)
         } else {
-            transfer_fee_config
+            let transfer_fee = transfer_fee_config
                 .calculate_inverse_epoch_fee(epoch, post_fee_amount)
-                .unwrap()
+                .unwrap();
+            let transfer_fee_for_check = transfer_fee_config
+                .calculate_epoch_fee(epoch, post_fee_amount.checked_add(transfer_fee).unwrap())
+                .unwrap();
+            if transfer_fee != transfer_fee_for_check {
+                return err!(ErrorCode::TransferFeeCalculateNotMatch);
+            }
+            transfer_fee
         }
     } else {
         0
@@ -189,6 +191,8 @@ pub fn is_supported_mint(mint_account: &InterfaceAccount<Mint>) -> Result<bool> 
         if e != ExtensionType::TransferFeeConfig
             && e != ExtensionType::MetadataPointer
             && e != ExtensionType::TokenMetadata
+            && e != ExtensionType::InterestBearingConfig
+            && e != ExtensionType::ScaledUiAmount
         {
             return Ok(false);
         }

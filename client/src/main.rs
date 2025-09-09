@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use anchor_client::{Client, Cluster};
+use anchor_spl::{associated_token::spl_associated_token_account, token::spl_token};
 use anyhow::{format_err, Result};
 use arrayref::array_ref;
 use clap::Parser;
@@ -21,10 +22,12 @@ use instructions::events_instructions_parse::*;
 use instructions::rpc::*;
 use instructions::token_instructions::*;
 use instructions::utils::*;
-use spl_token_2022::{
-    extension::StateWithExtensionsMut,
-    state::{Account, Mint},
-};
+// use spl_token_2022::{
+//     extension::StateWithExtensionsMut,
+//     state::{Account, Mint},
+// };
+
+use crate::instructions::utils;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClientConfig {
@@ -93,6 +96,8 @@ pub enum RaydiumCpCommands {
         init_amount_1: u64,
         #[arg(short, long, default_value_t = 0)]
         open_time: u64,
+        #[clap(short, long, action)]
+        random_pool: bool,
     },
     Deposit {
         pool_id: Pubkey,
@@ -149,6 +154,7 @@ fn main() -> Result<()> {
             init_amount_0,
             init_amount_1,
             open_time,
+            random_pool,
         } => {
             let (mint0, mint1, init_amount_0, init_amount_1) = if mint0 > mint1 {
                 (mint1, mint0, init_amount_1, init_amount_0)
@@ -160,21 +166,41 @@ fn main() -> Result<()> {
             let token_0_program = rsps[0].clone().unwrap().owner;
             let token_1_program = rsps[1].clone().unwrap().owner;
 
+            let mut signers = vec![&payer];
+
+            let random_pool_keypair = Keypair::new();
+            let random_pool_id = if random_pool {
+                let random_pool_id = random_pool_keypair.pubkey();
+                println!("random_pool_id:{}", random_pool_id);
+                signers.push(&random_pool_keypair);
+                Some(random_pool_id)
+            } else {
+                None
+            };
+
             let initialize_pool_instr = initialize_pool_instr(
                 &pool_config,
                 mint0,
                 mint1,
                 token_0_program,
                 token_1_program,
-                spl_associated_token_account::get_associated_token_address(&payer.pubkey(), &mint0),
-                spl_associated_token_account::get_associated_token_address(&payer.pubkey(), &mint1),
-                raydium_cp_swap::create_pool_fee_reveiver::id(),
+                spl_associated_token_account::get_associated_token_address_with_program_id(
+                    &payer.pubkey(),
+                    &mint0,
+                    &token_0_program,
+                ),
+                spl_associated_token_account::get_associated_token_address_with_program_id(
+                    &payer.pubkey(),
+                    &mint1,
+                    &token_1_program,
+                ),
+                raydium_cp_swap::create_pool_fee_reveiver::ID,
+                random_pool_id,
                 init_amount_0,
                 init_amount_1,
                 open_time,
             )?;
 
-            let signers = vec![&payer];
             let recent_hash = rpc_client.get_latest_blockhash()?;
             let txn = Transaction::new_signed_with_payer(
                 &initialize_pool_instr,
@@ -193,21 +219,26 @@ fn main() -> Result<()> {
         } => {
             let pool_state: raydium_cp_swap::states::PoolState = program.account(pool_id)?;
             // load account
-            let load_pubkeys = vec![pool_state.token_0_vault, pool_state.token_1_vault];
+            // pool_account and token vault0, token vault1 must be obtained together to ensure data consistency.
+            let load_pubkeys = vec![pool_id, pool_state.token_0_vault, pool_state.token_1_vault];
             let rsps = rpc_client.get_multiple_accounts(&load_pubkeys)?;
-            let [token_0_vault_account, token_1_vault_account] = array_ref![rsps, 0, 2];
+            let [pool_account, token_0_vault_account, token_1_vault_account] =
+                array_ref![rsps, 0, 3];
             // docode account
-            let mut token_0_vault_data = token_0_vault_account.clone().unwrap().data;
-            let mut token_1_vault_data = token_1_vault_account.clone().unwrap().data;
-            let token_0_vault_info =
-                StateWithExtensionsMut::<Account>::unpack(&mut token_0_vault_data)?;
-            let token_1_vault_info =
-                StateWithExtensionsMut::<Account>::unpack(&mut token_1_vault_data)?;
+            let pool_state =
+                utils::deserialize_anchor_account::<raydium_cp_swap::states::PoolState>(
+                    pool_account.as_ref().unwrap(),
+                )
+                .unwrap();
+            let token_0_vault_info = unpack_token(&token_0_vault_account.as_ref().unwrap().data)?;
+            let token_1_vault_info = unpack_token(&token_1_vault_account.as_ref().unwrap().data)?;
 
-            let (total_token_0_amount, total_token_1_amount) = pool_state.vault_amount_without_fee(
-                token_0_vault_info.base.amount,
-                token_1_vault_info.base.amount,
-            );
+            let (total_token_0_amount, total_token_1_amount) = pool_state
+                .vault_amount_without_fee(
+                    token_0_vault_info.base.amount.into(),
+                    token_1_vault_info.base.amount.into(),
+                )
+                .unwrap();
             // calculate amount
             let results = raydium_cp_swap::curve::CurveCalculator::lp_tokens_to_trading_tokens(
                 u128::from(lp_token_amount),
@@ -294,21 +325,26 @@ fn main() -> Result<()> {
         } => {
             let pool_state: raydium_cp_swap::states::PoolState = program.account(pool_id)?;
             // load account
-            let load_pubkeys = vec![pool_state.token_0_vault, pool_state.token_1_vault];
+            // pool_account and token vault0, token vault1 must be obtained together to ensure data consistency.
+            let load_pubkeys = vec![pool_id, pool_state.token_0_vault, pool_state.token_1_vault];
             let rsps = rpc_client.get_multiple_accounts(&load_pubkeys)?;
-            let [token_0_vault_account, token_1_vault_account] = array_ref![rsps, 0, 2];
+            let [pool_account, token_0_vault_account, token_1_vault_account] =
+                array_ref![rsps, 0, 3];
             // docode account
-            let mut token_0_vault_data = token_0_vault_account.clone().unwrap().data;
-            let mut token_1_vault_data = token_1_vault_account.clone().unwrap().data;
-            let token_0_vault_info =
-                StateWithExtensionsMut::<Account>::unpack(&mut token_0_vault_data)?;
-            let token_1_vault_info =
-                StateWithExtensionsMut::<Account>::unpack(&mut token_1_vault_data)?;
+            let pool_state =
+                utils::deserialize_anchor_account::<raydium_cp_swap::states::PoolState>(
+                    pool_account.as_ref().unwrap(),
+                )
+                .unwrap();
+            let token_0_vault_info = unpack_token(&token_0_vault_account.as_ref().unwrap().data)?;
+            let token_1_vault_info = unpack_token(&token_1_vault_account.as_ref().unwrap().data)?;
 
-            let (total_token_0_amount, total_token_1_amount) = pool_state.vault_amount_without_fee(
-                token_0_vault_info.base.amount,
-                token_1_vault_info.base.amount,
-            );
+            let (total_token_0_amount, total_token_1_amount) = pool_state
+                .vault_amount_without_fee(
+                    token_0_vault_info.base.amount.into(),
+                    token_1_vault_info.base.amount.into(),
+                )
+                .unwrap();
             // calculate amount
             let results = raydium_cp_swap::curve::CurveCalculator::lp_tokens_to_trading_tokens(
                 u128::from(lp_token_amount),
@@ -406,7 +442,9 @@ fn main() -> Result<()> {
         } => {
             let pool_state: raydium_cp_swap::states::PoolState = program.account(pool_id)?;
             // load account
+            // pool_account and token vault0, token vault1 must be obtained together to ensure data consistency.
             let load_pubkeys = vec![
+                pool_id,
                 pool_state.amm_config,
                 pool_state.token_0_vault,
                 pool_state.token_1_vault,
@@ -416,30 +454,30 @@ fn main() -> Result<()> {
             ];
             let rsps = rpc_client.get_multiple_accounts(&load_pubkeys)?;
             let epoch = rpc_client.get_epoch_info().unwrap().epoch;
-            let [amm_config_account, token_0_vault_account, token_1_vault_account, token_0_mint_account, token_1_mint_account, user_input_token_account] =
-                array_ref![rsps, 0, 6];
+            let [pool_account, amm_config_account, token_0_vault_account, token_1_vault_account, token_0_mint_account, token_1_mint_account, user_input_token_account] =
+                array_ref![rsps, 0, 7];
             // docode account
-            let mut token_0_vault_data = token_0_vault_account.clone().unwrap().data;
-            let mut token_1_vault_data = token_1_vault_account.clone().unwrap().data;
-            let mut token_0_mint_data = token_0_mint_account.clone().unwrap().data;
-            let mut token_1_mint_data = token_1_mint_account.clone().unwrap().data;
-            let mut user_input_token_data = user_input_token_account.clone().unwrap().data;
+            let pool_state =
+                utils::deserialize_anchor_account::<raydium_cp_swap::states::PoolState>(
+                    pool_account.as_ref().unwrap(),
+                )
+                .unwrap();
             let amm_config_state = deserialize_anchor_account::<raydium_cp_swap::states::AmmConfig>(
                 amm_config_account.as_ref().unwrap(),
             )?;
-            let token_0_vault_info =
-                StateWithExtensionsMut::<Account>::unpack(&mut token_0_vault_data)?;
-            let token_1_vault_info =
-                StateWithExtensionsMut::<Account>::unpack(&mut token_1_vault_data)?;
-            let token_0_mint_info = StateWithExtensionsMut::<Mint>::unpack(&mut token_0_mint_data)?;
-            let token_1_mint_info = StateWithExtensionsMut::<Mint>::unpack(&mut token_1_mint_data)?;
+            let token_0_vault_info = unpack_token(&token_0_vault_account.as_ref().unwrap().data)?;
+            let token_1_vault_info = unpack_token(&token_1_vault_account.as_ref().unwrap().data)?;
+            let token_0_mint_info = unpack_mint(&token_0_mint_account.as_ref().unwrap().data)?;
+            let token_1_mint_info = unpack_mint(&token_1_mint_account.as_ref().unwrap().data)?;
             let user_input_token_info =
-                StateWithExtensionsMut::<Account>::unpack(&mut user_input_token_data)?;
+                unpack_token(&user_input_token_account.as_ref().unwrap().data)?;
 
-            let (total_token_0_amount, total_token_1_amount) = pool_state.vault_amount_without_fee(
-                token_0_vault_info.base.amount,
-                token_1_vault_info.base.amount,
-            );
+            let (total_token_0_amount, total_token_1_amount) = pool_state
+                .vault_amount_without_fee(
+                    token_0_vault_info.base.amount.into(),
+                    token_1_vault_info.base.amount.into(),
+                )
+                .unwrap();
 
             let (
                 trade_direction,
@@ -498,12 +536,14 @@ fn main() -> Result<()> {
                 u128::from(total_input_token_amount),
                 u128::from(total_output_token_amount),
                 amm_config_state.trade_fee_rate,
+                amm_config_state.creator_fee_rate,
                 amm_config_state.protocol_fee_rate,
                 amm_config_state.fund_fee_rate,
+                pool_state.is_creator_fee_on_input(trade_direction).unwrap(),
             )
             .ok_or(raydium_cp_swap::error::ErrorCode::ZeroTradingTokens)
             .unwrap();
-            let amount_out = u64::try_from(result.destination_amount_swapped).unwrap();
+            let amount_out = u64::try_from(result.output_amount).unwrap();
             let transfer_fee = match trade_direction {
                 raydium_cp_swap::curve::TradeDirection::ZeroForOne => {
                     get_transfer_fee(&token_1_mint_info, epoch, amount_out)
@@ -560,7 +600,9 @@ fn main() -> Result<()> {
         } => {
             let pool_state: raydium_cp_swap::states::PoolState = program.account(pool_id)?;
             // load account
+            // pool_account and token vault0, token vault1 must be obtained together to ensure data consistency.
             let load_pubkeys = vec![
+                pool_id,
                 pool_state.amm_config,
                 pool_state.token_0_vault,
                 pool_state.token_1_vault,
@@ -570,30 +612,30 @@ fn main() -> Result<()> {
             ];
             let rsps = rpc_client.get_multiple_accounts(&load_pubkeys)?;
             let epoch = rpc_client.get_epoch_info().unwrap().epoch;
-            let [amm_config_account, token_0_vault_account, token_1_vault_account, token_0_mint_account, token_1_mint_account, user_input_token_account] =
-                array_ref![rsps, 0, 6];
+            let [pool_account, amm_config_account, token_0_vault_account, token_1_vault_account, token_0_mint_account, token_1_mint_account, user_input_token_account] =
+                array_ref![rsps, 0, 7];
             // docode account
-            let mut token_0_vault_data = token_0_vault_account.clone().unwrap().data;
-            let mut token_1_vault_data = token_1_vault_account.clone().unwrap().data;
-            let mut token_0_mint_data = token_0_mint_account.clone().unwrap().data;
-            let mut token_1_mint_data = token_1_mint_account.clone().unwrap().data;
-            let mut user_input_token_data = user_input_token_account.clone().unwrap().data;
+            let pool_state =
+                utils::deserialize_anchor_account::<raydium_cp_swap::states::PoolState>(
+                    pool_account.as_ref().unwrap(),
+                )
+                .unwrap();
             let amm_config_state = deserialize_anchor_account::<raydium_cp_swap::states::AmmConfig>(
                 amm_config_account.as_ref().unwrap(),
             )?;
-            let token_0_vault_info =
-                StateWithExtensionsMut::<Account>::unpack(&mut token_0_vault_data)?;
-            let token_1_vault_info =
-                StateWithExtensionsMut::<Account>::unpack(&mut token_1_vault_data)?;
-            let token_0_mint_info = StateWithExtensionsMut::<Mint>::unpack(&mut token_0_mint_data)?;
-            let token_1_mint_info = StateWithExtensionsMut::<Mint>::unpack(&mut token_1_mint_data)?;
+            let token_0_vault_info = unpack_token(&token_0_vault_account.as_ref().unwrap().data)?;
+            let token_1_vault_info = unpack_token(&token_1_vault_account.as_ref().unwrap().data)?;
+            let token_0_mint_info = unpack_mint(&token_0_mint_account.as_ref().unwrap().data)?;
+            let token_1_mint_info = unpack_mint(&token_1_mint_account.as_ref().unwrap().data)?;
             let user_input_token_info =
-                StateWithExtensionsMut::<Account>::unpack(&mut user_input_token_data)?;
+                unpack_token(&user_input_token_account.as_ref().unwrap().data)?;
 
-            let (total_token_0_amount, total_token_1_amount) = pool_state.vault_amount_without_fee(
-                token_0_vault_info.base.amount,
-                token_1_vault_info.base.amount,
-            );
+            let (total_token_0_amount, total_token_1_amount) = pool_state
+                .vault_amount_without_fee(
+                    token_0_vault_info.base.amount.into(),
+                    token_1_vault_info.base.amount.into(),
+                )
+                .unwrap();
 
             let (
                 trade_direction,
@@ -652,13 +694,15 @@ fn main() -> Result<()> {
                 u128::from(total_input_token_amount),
                 u128::from(total_output_token_amount),
                 amm_config_state.trade_fee_rate,
+                amm_config_state.creator_fee_rate,
                 amm_config_state.protocol_fee_rate,
                 amm_config_state.fund_fee_rate,
+                pool_state.is_creator_fee_on_input(trade_direction).unwrap(),
             )
             .ok_or(raydium_cp_swap::error::ErrorCode::ZeroTradingTokens)
             .unwrap();
 
-            let source_amount_swapped = u64::try_from(result.source_amount_swapped).unwrap();
+            let source_amount_swapped = u64::try_from(result.input_amount).unwrap();
             let amount_in_transfer_fee = match trade_direction {
                 raydium_cp_swap::curve::TradeDirection::ZeroForOne => {
                     get_transfer_inverse_fee(&token_0_mint_info, epoch, source_amount_swapped)
